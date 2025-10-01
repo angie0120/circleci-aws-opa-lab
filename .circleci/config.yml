@@ -56,6 +56,57 @@ jobs:
             echo "Non-compliant eval (expect denies):"
             opa eval -d policies/ -i noncompliant-s3.json "data.aws.s3.security.deny" --format pretty
 
+  validate-terraform:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install OPA and jq
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y jq curl
+            curl -L -o opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static
+            chmod +x opa
+            sudo mv opa /usr/local/bin/
+      - run:
+          name: Validate (intentionally non-compliant) resources and fail on denies
+          command: |
+            # Simulate parsed Terraform resources (non-compliant on purpose)
+            cat > terraform-resources.json \<<'JSON'
+            [
+              {
+                "resource_type": "aws_s3_bucket",
+                "resource_name": "policy_violation_bucket"
+              },
+              {
+                "resource_type": "aws_s3_bucket_acl",
+                "resource_name": "policy_violation_bucket_acl",
+                "acl": "public-read"
+              }
+            ]
+            JSON
+
+            VIOLATIONS=0
+            LEN=$(jq 'length' terraform-resources.json)
+            for i in $(seq 0 $((LEN-1))); do
+              jq -c ".[$i]" terraform-resources.json > /tmp/resource.json
+              OUT=$(opa eval -d policies/ -i /tmp/resource.json 'data.aws.s3.security.deny[x]' --format json)
+              if echo "$OUT" | jq -e '.result | length > 0' >/dev/null; then
+                echo "❌ Violations for resource #$i:"
+                echo "$OUT" | jq '.result'
+                VIOLATIONS=$((VIOLATIONS+1))
+              else
+                echo "✅ No denies for resource #$i"
+              fi
+            done
+
+            if [ "$VIOLATIONS" -gt 0 ]; then
+              echo "❌ Failing build due to policy violations (expected on main)."
+              exit 1
+            fi
+            echo "✅ No policy violations."
+
   test-aws-connection:
     docker:
       - image: cimg/base:stable
@@ -110,6 +161,11 @@ workflows:
       - policy-validation:
           requires:
             - test
-      - test-aws-connection:
+      # This gate should FAIL on main (intentional)
+      - validate-terraform:
           requires:
             - policy-validation
+      # Only runs if validate-terraform passed (e.g., on compliant branch later)
+      - test-aws-connection:
+          requires:
+            - validate-terraform
