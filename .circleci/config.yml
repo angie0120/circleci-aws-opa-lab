@@ -38,19 +38,24 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
     steps:
       - checkout
+
       - run:
-          name: Install AWS CLI (apt) and Terraform
+          name: Install AWS CLI and Terraform (safe install path)
           command: |
             set -euxo pipefail
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends unzip jq curl awscli ca-certificates
             aws --version
-            # Terraform via curl
+
+            # Install Terraform without colliding with repo's ./terraform directory
             TF_VERSION=1.6.0
-            curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o terraform.zip
-            unzip -q -o terraform.zip
-            sudo mv -f terraform /usr/local/bin/terraform
+            TMPDIR="$(mktemp -d)"
+            curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o "${TMPDIR}/terraform.zip"
+            unzip -q -o "${TMPDIR}/terraform.zip" -d "${TMPDIR}"
+            sudo mv "${TMPDIR}/terraform" /usr/local/bin/terraform
+            sudo chmod 0755 /usr/local/bin/terraform
             terraform -version
+
       - run:
           name: OIDC assume role + Terraform apply & destroy (single step)
           command: |
