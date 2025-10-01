@@ -9,11 +9,11 @@ jobs:
       - run:
           name: Install OPA and jq
           command: |
+            set -e
             sudo apt-get update
             sudo apt-get install -y jq curl
             curl -L -o opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static
-            chmod +x opa
-            sudo mv opa /usr/local/bin/
+            chmod +x opa && sudo mv opa /usr/local/bin/
       - run:
           name: Run OPA unit tests
           command: opa test policies/ tests/
@@ -41,25 +41,50 @@ jobs:
       - run:
           name: Install AWS CLI and Terraform
           command: |
+            set -e
             sudo apt-get update
             sudo apt-get install -y unzip jq curl
+            # AWS CLI
             curl -sS https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
             unzip -o awscliv2.zip
             sudo ./aws/install
-            wget https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip
+            aws --version
+            # Terraform via curl (no wget)
+            curl -L https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip -o terraform_1.6.0_linux_amd64.zip
             unzip -o terraform_1.6.0_linux_amd64.zip
             sudo mv terraform /usr/local/bin/
+            terraform -version
       - run:
-          name: Deploy compliant S3 bucket
+          name: Assume role via OIDC (verify creds)
           command: |
+            set -e
             export AWS_ROLE_ARN="arn:aws:iam::399966706844:role/CircleCILabRole"
             export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web-identity-token"
             echo "$CIRCLE_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
-
+            # Quick check before Terraform:
+            aws sts get-caller-identity
+      - run:
+          name: Deploy compliant S3 (encrypt + block public + versioning)
+          command: |
+            set -e
             mkdir -p terraform
             cd terraform
 
             cat > main.tf \<<'TERRAFORM'
+            terraform {
+              required_version = ">= 1.6.0"
+              required_providers {
+                aws = {
+                  source  = "hashicorp/aws"
+                  version = ">= 5.0"
+                }
+                random = {
+                  source  = "hashicorp/random"
+                  version = ">= 3.0"
+                }
+              }
+            }
+
             provider "aws" {
               region = "us-east-1"
             }
@@ -103,13 +128,17 @@ jobs:
             }
             TERRAFORM
 
-            terraform init
-            terraform apply -auto-approve
+            terraform init -input=false
+            terraform plan -out=tfplan -input=false
+            terraform apply -auto-approve tfplan
+
+            echo "✅ Compliant infrastructure deployed:"
             terraform output
 
-            # Clean up to avoid charges
+            # Cleanup to avoid charges
             terraform destroy -auto-approve
-
+            echo "✅ Cleaned up"
+            
 workflows:
   security-pipeline:
     jobs:
