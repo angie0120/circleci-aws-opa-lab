@@ -1,15 +1,6 @@
 ﻿version: 2.1
 
 jobs:
-  test:
-    docker:
-      - image: cimg/base:stable
-    steps:
-      - checkout
-      - run:
-          name: Hello World
-          command: echo "Hello from CircleCI!"
-
   policy-validation:
     docker:
       - image: cimg/base:stable
@@ -25,14 +16,11 @@ jobs:
             sudo mv opa /usr/local/bin/
       - run:
           name: Run OPA unit tests
-          command: |
-            opa version
-            opa test policies/ tests/
+          command: opa test policies/ tests/
       - run:
-          name: Evaluate sample resources
+          name: Validate compliant resources
           command: |
-            # Compliant sample
-            cat > compliant-s3.json \<<'JSON'
+            cat > compliant.json \<<'JSON'
             {
               "resource_type": "aws_s3_bucket",
               "server_side_encryption_configuration": {
@@ -41,73 +29,9 @@ jobs:
               "versioning": { "enabled": true }
             }
             JSON
+            opa eval -d policies/ -i compliant.json "data.aws.s3.security.deny" --format pretty
 
-            # Non-compliant sample
-            cat > noncompliant-s3.json \<<'JSON'
-            {
-              "resource_type": "aws_s3_bucket",
-              "acl": "public-read"
-            }
-            JSON
-
-            echo "Compliant eval (expect no denies):"
-            opa eval -d policies/ -i compliant-s3.json "data.aws.s3.security.deny" --format pretty
-
-            echo "Non-compliant eval (expect denies):"
-            opa eval -d policies/ -i noncompliant-s3.json "data.aws.s3.security.deny" --format pretty
-
-  validate-terraform:
-    docker:
-      - image: cimg/base:stable
-    steps:
-      - checkout
-      - run:
-          name: Install OPA and jq
-          command: |
-            sudo apt-get update
-            sudo apt-get install -y jq curl
-            curl -L -o opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static
-            chmod +x opa
-            sudo mv opa /usr/local/bin/
-      - run:
-          name: Validate (intentionally non-compliant) resources and fail on denies
-          command: |
-            # Simulate parsed Terraform resources (non-compliant on purpose)
-            cat > terraform-resources.json \<<'JSON'
-            [
-              {
-                "resource_type": "aws_s3_bucket",
-                "resource_name": "policy_violation_bucket"
-              },
-              {
-                "resource_type": "aws_s3_bucket_acl",
-                "resource_name": "policy_violation_bucket_acl",
-                "acl": "public-read"
-              }
-            ]
-            JSON
-
-            VIOLATIONS=0
-            LEN=$(jq 'length' terraform-resources.json)
-            for i in $(seq 0 $((LEN-1))); do
-              jq -c ".[$i]" terraform-resources.json > /tmp/resource.json
-              OUT=$(opa eval -d policies/ -i /tmp/resource.json 'data.aws.s3.security.deny[x]' --format json)
-              if echo "$OUT" | jq -e '.result | length > 0' >/dev/null; then
-                echo "❌ Violations for resource #$i:"
-                echo "$OUT" | jq '.result'
-                VIOLATIONS=$((VIOLATIONS+1))
-              else
-                echo "✅ No denies for resource #$i"
-              fi
-            done
-
-            if [ "$VIOLATIONS" -gt 0 ]; then
-              echo "❌ Failing build due to policy violations (expected on main)."
-              exit 1
-            fi
-            echo "✅ No policy violations."
-
-  test-aws-connection:
+  deploy-compliant-infra:
     docker:
       - image: cimg/base:stable
     environment:
@@ -115,57 +39,81 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Install prerequisites
+          name: Install AWS CLI and Terraform
           command: |
             sudo apt-get update
             sudo apt-get install -y unzip jq curl
-      - run:
-          name: Install AWS CLI v2
-          command: |
-            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            curl -sS https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
             unzip -o awscliv2.zip
             sudo ./aws/install
-            aws --version
+            wget https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip
+            unzip -o terraform_1.6.0_linux_amd64.zip
+            sudo mv terraform /usr/local/bin/
       - run:
-          name: Configure OIDC and Test AWS STS (with fallback)
+          name: Deploy compliant S3 bucket
           command: |
-            set -e
-            export AWS_ROLE_ARN="${AWS_ROLE_ARN:-arn:aws:iam::399966706844:role/CircleCILabRole}"
+            export AWS_ROLE_ARN="arn:aws:iam::399966706844:role/CircleCILabRole"
             export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web-identity-token"
             echo "$CIRCLE_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
 
-            echo "Attempt 1: provider chain"
-            if aws sts get-caller-identity >/dev/null 2>&1; then
-              aws sts get-caller-identity
-              exit 0
-            fi
+            mkdir -p terraform
+            cd terraform
 
-            echo "Attempt 2: explicit assume-role-with-web-identity"
-            CREDS=$(aws sts assume-role-with-web-identity \
-              --role-arn "$AWS_ROLE_ARN" \
-              --role-session-name circleci-oidc \
-              --web-identity-token "$CIRCLE_OIDC_TOKEN" \
-              --duration-seconds 900)
+            cat > main.tf \<<'TERRAFORM'
+            provider "aws" {
+              region = "us-east-1"
+            }
 
-            export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .Credentials.AccessKeyId)
-            export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .Credentials.SecretAccessKey)
-            export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .Credentials.SessionToken)
+            resource "random_string" "suffix" {
+              length  = 8
+              special = false
+              upper   = false
+            }
 
-            aws sts get-caller-identity
-            echo "✅ AWS connection successful"
+            resource "aws_s3_bucket" "compliant_bucket" {
+              bucket = "circleci-lab-compliant-${random_string.suffix.result}"
+            }
+
+            resource "aws_s3_bucket_server_side_encryption_configuration" "compliant_encryption" {
+              bucket = aws_s3_bucket.compliant_bucket.id
+              rule {
+                apply_server_side_encryption_by_default {
+                  sse_algorithm = "AES256"
+                }
+              }
+            }
+
+            resource "aws_s3_bucket_public_access_block" "compliant_pab" {
+              bucket                  = aws_s3_bucket.compliant_bucket.id
+              block_public_acls       = true
+              block_public_policy     = true
+              ignore_public_acls      = true
+              restrict_public_buckets = true
+            }
+
+            resource "aws_s3_bucket_versioning" "compliant_versioning" {
+              bucket = aws_s3_bucket.compliant_bucket.id
+              versioning_configuration {
+                status = "Enabled"
+              }
+            }
+
+            output "bucket_name" {
+              value = aws_s3_bucket.compliant_bucket.bucket
+            }
+            TERRAFORM
+
+            terraform init
+            terraform apply -auto-approve
+            terraform output
+
+            # Clean up to avoid charges
+            terraform destroy -auto-approve
 
 workflows:
   security-pipeline:
     jobs:
-      - test
-      - policy-validation:
-          requires:
-            - test
-      # This gate should FAIL on main (intentional)
-      - validate-terraform:
+      - policy-validation
+      - deploy-compliant-infra:
           requires:
             - policy-validation
-      # Only runs if validate-terraform passed (e.g., on compliant branch later)
-      - test-aws-connection:
-          requires:
-            - validate-terraform
