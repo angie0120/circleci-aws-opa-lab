@@ -10,21 +10,63 @@ jobs:
           name: Hello World
           command: echo "Hello from CircleCI!"
 
+  policy-validation:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install OPA and jq
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y jq curl
+            curl -L -o opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static
+            chmod +x opa
+            sudo mv opa /usr/local/bin/
+      - run:
+          name: Run OPA unit tests
+          command: |
+            opa version
+            opa test policies/ tests/
+      - run:
+          name: Evaluate sample resources
+          command: |
+            # Compliant sample
+            cat > compliant-s3.json <<'JSON'
+            {
+              "resource_type": "aws_s3_bucket",
+              "server_side_encryption_configuration": {
+                "rule": { "apply_server_side_encryption_by_default": { "sse_algorithm": "AES256" } }
+              },
+              "versioning": { "enabled": true }
+            }
+            JSON
+            # Non-compliant sample
+            cat > noncompliant-s3.json <<'JSON'
+            {
+              "resource_type": "aws_s3_bucket",
+              "acl": "public-read"
+            }
+            JSON
+
+            echo "Compliant eval (expect no denies):"
+            opa eval -d policies/ -i compliant-s3.json "data.aws.s3.security.deny" --format pretty
+
+            echo "Non-compliant eval (expect denies):"
+            opa eval -d policies/ -i noncompliant-s3.json "data.aws.s3.security.deny" --format pretty
+
   test-aws-connection:
     docker:
       - image: cimg/base:stable
     environment:
-      # Safe default; if you also set AWS_DEFAULT_REGION in CircleCI UI, that wins
       AWS_DEFAULT_REGION: us-east-1
     steps:
       - checkout
-
       - run:
           name: Install prerequisites
           command: |
             sudo apt-get update
             sudo apt-get install -y unzip jq curl
-
       - run:
           name: Install AWS CLI v2
           command: |
@@ -32,30 +74,36 @@ jobs:
             unzip -o awscliv2.zip
             sudo ./aws/install
             aws --version
-
       - run:
-          name: Configure OIDC and Test AWS STS
+          name: Configure OIDC and Test AWS STS (with fallback)
           command: |
-            # If you added AWS_ROLE_ARN in the CircleCI UI, we'll use it.
-            # Otherwise we fall back to your role below.
+            set -e
             export AWS_ROLE_ARN="${AWS_ROLE_ARN:-arn:aws:iam::399966706844:role/CircleCILabRole}"
-
-            # CircleCI provides an OIDC token to jobs; write it to the file AWS expects.
             export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web-identity-token"
             echo "$CIRCLE_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
-
-            echo "Using role: $AWS_ROLE_ARN"
-            echo "Region: ${AWS_DEFAULT_REGION:-not set}"
-
-            # This call succeeds only if the trust policy & provider are correct
+            echo "Attempt 1: provider chain"
+            if aws sts get-caller-identity >/dev/null 2>&1; then
+              aws sts get-caller-identity
+              exit 0
+            fi
+            echo "Attempt 2: explicit assume-role-with-web-identity"
+            CREDS=$(aws sts assume-role-with-web-identity \
+              --role-arn "$AWS_ROLE_ARN" \
+              --role-session-name circleci-oidc \
+              --web-identity-token "$CIRCLE_OIDC_TOKEN" \
+              --duration-seconds 900)
+            export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .Credentials.AccessKeyId)
+            export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .Credentials.SecretAccessKey)
+            export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .Credentials.SessionToken)
             aws sts get-caller-identity
-
-            echo "✅ AWS connection successful"
 
 workflows:
   security-pipeline:
     jobs:
       - test
-      - test-aws-connection:
+      - policy-validation:
           requires:
             - test
+      - test-aws-connection:
+          requires:
+            - policy-validation
