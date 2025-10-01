@@ -49,24 +49,23 @@ jobs:
             unzip -o awscliv2.zip
             sudo ./aws/install
             aws --version
-            # Terraform via curl (no wget)
+            # Terraform via curl
             curl -L https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip -o terraform_1.6.0_linux_amd64.zip
             unzip -o terraform_1.6.0_linux_amd64.zip
             sudo mv terraform /usr/local/bin/
             terraform -version
       - run:
-          name: Assume role via OIDC (verify creds)
+          name: OIDC assume role + Terraform apply & destroy (single step)
           command: |
             set -e
-            export AWS_ROLE_ARN="arn:aws:iam::399966706844:role/CircleCILabRole"
+            # OIDC env must be set in THIS step
+            export AWS_ROLE_ARN="${AWS_ROLE_ARN:-arn:aws:iam::399966706844:role/CircleCILabRole}"
             export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web-identity-token"
             echo "$CIRCLE_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
-            # Quick check before Terraform:
+
+            echo "STS identity (sanity check):"
             aws sts get-caller-identity
-      - run:
-          name: Deploy compliant S3 (encrypt + block public + versioning)
-          command: |
-            set -e
+
             mkdir -p terraform
             cd terraform
 
@@ -74,20 +73,12 @@ jobs:
             terraform {
               required_version = ">= 1.6.0"
               required_providers {
-                aws = {
-                  source  = "hashicorp/aws"
-                  version = ">= 5.0"
-                }
-                random = {
-                  source  = "hashicorp/random"
-                  version = ">= 3.0"
-                }
+                aws = { source = "hashicorp/aws",   version = ">= 5.0" }
+                random = { source = "hashicorp/random", version = ">= 3.0" }
               }
             }
 
-            provider "aws" {
-              region = "us-east-1"
-            }
+            provider "aws" { region = "us-east-1" }
 
             resource "random_string" "suffix" {
               length  = 8
@@ -118,14 +109,10 @@ jobs:
 
             resource "aws_s3_bucket_versioning" "compliant_versioning" {
               bucket = aws_s3_bucket.compliant_bucket.id
-              versioning_configuration {
-                status = "Enabled"
-              }
+              versioning_configuration { status = "Enabled" }
             }
 
-            output "bucket_name" {
-              value = aws_s3_bucket.compliant_bucket.bucket
-            }
+            output "bucket_name" { value = aws_s3_bucket.compliant_bucket.bucket }
             TERRAFORM
 
             terraform init -input=false
@@ -135,10 +122,10 @@ jobs:
             echo "✅ Compliant infrastructure deployed:"
             terraform output
 
-            # Cleanup to avoid charges
+            # Always cleanup to avoid charges
             terraform destroy -auto-approve
             echo "✅ Cleaned up"
-            
+
 workflows:
   security-pipeline:
     jobs:
