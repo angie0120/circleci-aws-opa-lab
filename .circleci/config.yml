@@ -10,7 +10,52 @@ jobs:
           name: Hello World
           command: echo "Hello from CircleCI!"
 
+  test-aws-connection:
+    docker:
+      - image: cimg/base:stable
+    environment:
+      # Safe default; if you also set AWS_DEFAULT_REGION in CircleCI UI, that wins
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - checkout
+
+      - run:
+          name: Install prerequisites
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y unzip jq curl
+
+      - run:
+          name: Install AWS CLI v2
+          command: |
+            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -o awscliv2.zip
+            sudo ./aws/install
+            aws --version
+
+      - run:
+          name: Configure OIDC and Test AWS STS
+          command: |
+            # If you added AWS_ROLE_ARN in the CircleCI UI, we'll use it.
+            # Otherwise we fall back to your role below.
+            export AWS_ROLE_ARN="${AWS_ROLE_ARN:-arn:aws:iam::399966706844:role/CircleCILabRole}"
+
+            # CircleCI provides an OIDC token to jobs; write it to the file AWS expects.
+            export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/web-identity-token"
+            echo "$CIRCLE_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+
+            echo "Using role: $AWS_ROLE_ARN"
+            echo "Region: ${AWS_DEFAULT_REGION:-not set}"
+
+            # This call succeeds only if the trust policy & provider are correct
+            aws sts get-caller-identity
+
+            echo "✅ AWS connection successful"
+
 workflows:
-  test-workflow:
+  security-pipeline:
     jobs:
       - test
+      - test-aws-connection:
+          requires:
+            - test
